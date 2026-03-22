@@ -1,0 +1,42 @@
+# Environment — NEVER commit this. It has your personal config.
+.env
+
+# Python cache files — auto-generated, not needed in repo
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment folders
+venv/
+env/
+.venv/
+.env/
+
+# Watcher runtime data — personal data, stays on your machine
+data/watcher.db
+data/chroma/
+data/*.log
+
+# Keep the data folder itself (but not its contents)
+!data/.gitkeep
+!data/chroma/.gitkeep
+
+# IDE folders
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Windows system files
+Thumbs.db
+desktop.ini
+
+# PyInstaller build output (for when we package Watcher later)
+dist/
+build/
+*.spec
+
+# pytest cache
+.pytest_cache/
