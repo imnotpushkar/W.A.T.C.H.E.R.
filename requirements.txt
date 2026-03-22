@@ -40,3 +40,9 @@ PySide6>=6.6.0              # Qt6 Python bindings — replaces PyQt5
 
 # --- Utilities ---
 Pillow>=10.0.0              # Image handling for pyautogui
+
+# --- kokoro-onnx (local TTS — primary engine) ---
+kokoro-onnx>=0.4.7          # Local neural TTS, Python 3.14 compatible
+soundfile>=0.13.0           # Writes WAV files from kokoro audio arrays
+onnxruntime>=1.20.1         # ONNX model inference runtime
+espeakng-loader>=0.2.4      # Bundles espeak-ng for phonemization (no manual install)
