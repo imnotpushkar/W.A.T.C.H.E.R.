@@ -1,15 +1,8 @@
 """
 output/inline_suggest.py — Inline Suggestion Manager
 =====================================================
-Manages the suggestion lifecycle: show → Tab to accept / Esc to dismiss.
-
-BUG FIXES IN THIS VERSION:
-    1. _raw_text vs _display_text separation:
-       _raw_text  = the actual suggestion to type (no emoji, no instructions)
-       _display_text = what the overlay shows (formatted with hints)
-       Tab now types _raw_text only — not the formatted display string.
-
-    2. Streaming also tracks raw vs display separately.
+Manages suggestion lifecycle: show → Tab accept / Esc dismiss.
+Now speaks accepted/dismissed templates via voice_output.
 """
 
 import threading
@@ -23,72 +16,54 @@ log = get_logger(__name__)
 class InlineSuggestion:
 
     def __init__(self):
-        self._raw_text: str = ""          # What gets typed on Tab
-        self._display_text: str = ""      # What the overlay shows
+        self._raw_text: str = ""
+        self._display_text: str = ""
         self._is_active: bool = False
         self._key_listener: Optional[kb.Listener] = None
         self._overlay = None
         self._typist = None
+        self._voice_output = None
+        self._app_name: str = ""
         log.debug("InlineSuggestion initialised")
 
-    def set_dependencies(self, overlay, typist) -> None:
+    def set_dependencies(self, overlay, typist, voice_output=None) -> None:
         self._overlay = overlay
         self._typist = typist
+        self._voice_output = voice_output
         log.debug("InlineSuggestion dependencies set")
 
+    def set_app_name(self, app_name: str) -> None:
+        """Called by orchestrator so accepted/dismissed templates know the app."""
+        self._app_name = app_name
+
     def show(self, text: str) -> None:
-        """
-        Displays a completed suggestion in the overlay.
-        Stores raw text separately from display text.
-        """
         if not text or not text.strip():
             return
-
         if self._is_active:
             self._dismiss(reason="replaced")
-
         self._raw_text = text.strip()
         self._display_text = self._format_for_display(self._raw_text)
         self._is_active = True
-
         if self._overlay:
             self._overlay.show_suggestion(self._display_text)
-
         self._start_key_listener()
         log.info("Suggestion active (%d chars)", len(self._raw_text))
 
     def show_streaming(self, token: str) -> None:
-        """
-        Appends a streaming token. Raw text accumulates separately
-        from what the overlay displays during streaming.
-        """
         self._raw_text += token
-
-        # During streaming we show just the raw text — no instructions yet.
-        # Instructions are added after streaming completes (in show()).
-        # This avoids "[Tab] Accept" appearing mid-stream.
         if self._overlay:
             self._overlay.append_token(token)
-
         if not self._is_active:
             self._is_active = True
             self._start_key_listener()
 
     def finalize_stream(self) -> None:
-        """
-        Call this after streaming completes to update the overlay
-        with the final formatted display (adds Tab/Esc instructions).
-        Called from orchestrator after the LLM stream finishes.
-        """
+        """Adds [Tab]/[Esc] instructions after stream completes."""
         if self._raw_text and self._overlay:
             self._display_text = self._format_for_display(self._raw_text)
             self._overlay.show_suggestion(self._display_text)
 
     def _format_for_display(self, raw_text: str) -> str:
-        """
-        Adds visual instructions to the raw suggestion for display only.
-        This string is NEVER typed — only shown.
-        """
         return f"💡 {raw_text}\n\n[Tab] Accept   [Esc] Dismiss"
 
     def _start_key_listener(self) -> None:
@@ -111,13 +86,13 @@ class InlineSuggestion:
             return False
         try:
             if key == kb.Key.tab:
-                log.info("Tab — accepting suggestion")
+                log.info("Tab — accepting")
                 threading.Thread(
                     target=self._accept, daemon=True, name="watcher-accept"
                 ).start()
                 return False
             elif key == kb.Key.esc:
-                log.info("Esc — dismissing suggestion")
+                log.info("Esc — dismissing")
                 threading.Thread(
                     target=self._dismiss, args=("escape",),
                     daemon=True, name="watcher-dismiss"
@@ -128,8 +103,8 @@ class InlineSuggestion:
         return None
 
     def _accept(self) -> None:
-        """Types _raw_text only — never the display-formatted string."""
-        text_to_type = self._raw_text     # RAW text only
+        """Types the suggestion and speaks the accepted template."""
+        text_to_type = self._raw_text
         self._is_active = False
         self._stop_key_listener()
 
@@ -137,17 +112,34 @@ class InlineSuggestion:
             self._overlay.hide_overlay()
 
         if self._typist and text_to_type:
-            log.info("Typing: %s...", text_to_type[:50])
             self._typist.type_text(text_to_type)
+
+        # Speak accepted template AFTER typing
+        if self._voice_output:
+            from brain.voice_templates import accepted
+            self._voice_output.speak(
+                accepted(self._app_name), blocking=False
+            )
 
         self._raw_text = ""
         self._display_text = ""
+        log.info("Suggestion accepted and typed")
 
     def _dismiss(self, reason: str = "unknown") -> None:
+        """Hides overlay and speaks dismissed template."""
         self._is_active = False
         self._stop_key_listener()
+
         if self._overlay:
             self._overlay.hide_overlay()
+
+        # Speak dismissed template
+        if self._voice_output and reason == "escape":
+            from brain.voice_templates import dismissed
+            self._voice_output.speak(
+                dismissed(self._app_name), blocking=False
+            )
+
         self._raw_text = ""
         self._display_text = ""
         log.info("Suggestion dismissed (%s)", reason)
