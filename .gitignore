@@ -18,6 +18,11 @@ env/
 data/watcher.db
 data/chroma/
 data/*.log
+data/*.wav
+data/*.mp3
+data/*.onnx
+data/*.bin
+
 
 # Keep the data folder itself (but not its contents)
 !data/.gitkeep
