@@ -1,7 +1,22 @@
 """
-core/orchestrator.py — Central Router and State Manager
-=========================================================
-Coordinates all Watcher components in response to trigger events.
+core/orchestrator.py — Central Router
+=======================================
+Phase 1 pipeline: screen read → suggestion (typed) → spoken commentary.
+
+TWO-CALL ARCHITECTURE:
+    Call 1 — mode="suggestion": streams the clean typed suggestion into overlay
+    Call 2 — mode="spoken": generates a short Jarvis-style spoken line for TTS
+
+    These are separate Ollama calls with different system prompts.
+    Call 1 streams to overlay in real time.
+    Call 2 happens after Call 1 completes, result goes straight to TTS.
+
+    WHY NOT ONE CALL?
+        One call would mean the spoken text and typed text are mixed together,
+        requiring parsing to separate them — fragile and error-prone.
+        Two calls with different system prompts is cleaner and more reliable.
+        The extra latency is acceptable since Call 2 only starts after
+        the user has already seen and accepted/dismissed the suggestion.
 """
 
 import threading
@@ -41,7 +56,9 @@ class Orchestrator:
                 self._is_processing = False
 
     def _run_pipeline(self) -> None:
+        # ---------------------------------------------------------------
         # Step 1: Read screen
+        # ---------------------------------------------------------------
         log.info("Pipeline started — reading screen")
         screen_data = screen_reader.read_active_window()
         app_name = screen_data.get("app_name", "Unknown")
@@ -50,35 +67,50 @@ class Orchestrator:
         focused_text = screen_data.get("focused_text", "")
         log.info("Screen read — app: %s, chars: %d", app_name, len(text_content))
 
-        # Step 2: Build prompt
-        prompt = self._build_prompt(app_name, window_title, text_content, focused_text)
-        log.debug("Prompt built (%d chars)", len(prompt))
+        # ---------------------------------------------------------------
+        # Step 2: Build prompts
+        # ---------------------------------------------------------------
+        suggestion_prompt = self._build_suggestion_prompt(
+            app_name, window_title, text_content, focused_text
+        )
+        spoken_prompt = self._build_spoken_prompt(
+            app_name, window_title, text_content
+        )
 
-        # Step 3: Stream from Ollama, show tokens in overlay
-        log.info("Sending to Ollama...")
-        full_response = ""
-        for token in llm_client.generate_stream(prompt):
-            full_response += token
+        # ---------------------------------------------------------------
+        # Step 3: Stream typed suggestion into overlay (Call 1)
+        # ---------------------------------------------------------------
+        log.info("Generating suggestion...")
+        full_suggestion = ""
+        for token in llm_client.generate_stream(suggestion_prompt, mode="suggestion"):
+            full_suggestion += token
             if self._inline_suggestion:
                 self._inline_suggestion.show_streaming(token)
 
-        log.info("Ollama response complete (%d chars)", len(full_response))
+        log.info("Suggestion complete (%d chars): %s", len(full_suggestion), full_suggestion[:60])
 
-        if not full_response or full_response.startswith("[Watcher:"):
-            log.warning("Empty or error response from Ollama")
+        if not full_suggestion or full_suggestion.startswith("[Watcher:"):
+            log.warning("Bad suggestion response")
             return
 
-        # Step 4: Finalize overlay — adds [Tab]/[Esc] instructions now that
-        # streaming is done. We don't add them mid-stream because they'd
-        # appear as the model is still generating tokens.
+        # Finalize overlay — adds [Tab]/[Esc] instructions
         if self._inline_suggestion:
             self._inline_suggestion.finalize_stream()
 
-        # Step 5: Speak the response
-        if self._voice_output:
-            self._voice_output.speak(full_response, blocking=False)
+        # ---------------------------------------------------------------
+        # Step 4: Generate spoken commentary (Call 2) and speak it
+        # ---------------------------------------------------------------
+        # This runs AFTER the suggestion is ready so the user sees the
+        # overlay immediately. The spoken line then plays while they
+        # decide whether to accept or dismiss.
+        log.info("Generating spoken commentary...")
+        spoken_response = llm_client.generate(spoken_prompt, mode="spoken")
+        log.info("Speaking: %s", spoken_response[:80])
 
-    def _build_prompt(
+        if self._voice_output and spoken_response:
+            self._voice_output.speak(spoken_response, blocking=False)
+
+    def _build_suggestion_prompt(
         self,
         app_name: str,
         window_title: str,
@@ -86,41 +118,53 @@ class Orchestrator:
         focused_text: str
     ) -> str:
         """
-        Builds the prompt sent to Ollama.
-
-        PROMPT QUALITY FIX:
-            The previous prompt was too vague — "provide a helpful response".
-            Vague instructions produce meta-commentary instead of direct action.
-            We now give specific, firm instructions based on what we can detect:
-            - If there's text being typed → suggest how to complete/improve it
-            - If there's a conversation → suggest a reply (text only, no preamble)
-            - Otherwise → summarise what's on screen concisely
+        Prompt for the clean typed suggestion.
+        Strict — output must be only the text to type.
         """
-        sections = []
-        sections.append(f"APP: {app_name}")
+        parts = [f"APP: {app_name}"]
 
         if window_title and window_title != app_name:
-            sections.append(f"WINDOW: {window_title}")
+            parts.append(f"WINDOW: {window_title}")
 
-        if text_content and not text_content.startswith("[Screen content"):
+        if text_content and not text_content.startswith("[Screen"):
             content = text_content[-2000:] if len(text_content) > 2000 else text_content
-            sections.append(f"SCREEN CONTENT:\n{content}")
+            parts.append(f"SCREEN CONTENT:\n{content}")
 
         if focused_text:
-            sections.append(f"USER IS CURRENTLY TYPING: {focused_text}")
+            parts.append(f"USER IS TYPING: {focused_text}")
 
-        # Firm, specific instruction — no wiggle room for meta-commentary
-        sections.append(
-            "INSTRUCTION: Based on the screen content above, provide ONE of:\n"
-            "- If the user is typing a message: suggest the best completion or reply. "
-            "Write ONLY the message text. No explanations, no preamble.\n"
-            "- If there is a conversation visible: write a suggested reply. "
-            "Write ONLY the reply text.\n"
-            "- Otherwise: give a single short helpful observation or action.\n"
-            "Be direct. No meta-commentary. No 'I notice you are...' or 'It looks like...'"
+        parts.append(
+            "Output ONLY the suggested reply or text completion. "
+            "No explanation. No preamble. Just the text itself."
         )
+        return "\n\n".join(parts)
 
-        return "\n\n".join(sections)
+    def _build_spoken_prompt(
+        self,
+        app_name: str,
+        window_title: str,
+        text_content: str,
+    ) -> str:
+        """
+        Prompt for the Jarvis-style spoken commentary.
+        Should describe what Watcher just did / observed in 1-2 sentences.
+        """
+        parts = [f"APP: {app_name}"]
+
+        if window_title and window_title != app_name:
+            parts.append(f"WINDOW: {window_title}")
+
+        if text_content and not text_content.startswith("[Screen"):
+            # Only send a short excerpt for spoken context — we don't need the full thing
+            excerpt = text_content[-500:] if len(text_content) > 500 else text_content
+            parts.append(f"SCREEN EXCERPT:\n{excerpt}")
+
+        parts.append(
+            "You've just generated a text suggestion for the user. "
+            "In 1-2 sentences, tell them what you observed and what the suggestion is for. "
+            "Speak as Watcher. Be brief, confident, and direct."
+        )
+        return "\n\n".join(parts)
 
 
 orchestrator = Orchestrator()
