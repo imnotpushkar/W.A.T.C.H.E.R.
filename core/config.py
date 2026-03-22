@@ -140,3 +140,9 @@ CHROMA_PATH: Path = PROJECT_ROOT / os.getenv("CHROMA_PATH", "data/chroma")
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 CHROMA_PATH.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Kokoro TTS
+# ---------------------------------------------------------------------------
+KOKORO_VOICE: str = os.getenv("KOKORO_VOICE", "bm_lewis")
+KOKORO_SPEED: float = float(os.getenv("KOKORO_SPEED", "1.4"))

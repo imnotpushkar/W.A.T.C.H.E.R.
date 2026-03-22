@@ -30,15 +30,15 @@ import threading
 from pathlib import Path
 from typing import Generator, Optional
 
-from core.config import TTS_VOICE, PROJECT_ROOT
+from core.config import TTS_VOICE, PROJECT_ROOT, KOKORO_VOICE as _KOKORO_VOICE, KOKORO_SPEED as _KOKORO_SPEED
 from core.logger import get_logger
 
 log = get_logger(__name__)
 
 KOKORO_MODEL_PATH = PROJECT_ROOT / "data" / "kokoro-v1.0.int8.onnx"
 KOKORO_VOICES_PATH = PROJECT_ROOT / "data" / "voices-v1.0.bin"
-KOKORO_VOICE = "bm_lewis"
-KOKORO_SPEED = 1.3
+KOKORO_VOICE = _KOKORO_VOICE
+KOKORO_SPEED = _KOKORO_SPEED
 KOKORO_LANG = "en-us"
 
 # Abbreviations that contain dots but are NOT sentence endings

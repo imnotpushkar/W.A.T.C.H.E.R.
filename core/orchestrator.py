@@ -1,33 +1,38 @@
 """
 core/orchestrator.py — Central Router
 =======================================
-Parallel streaming architecture:
+STAGGERED STREAMING ARCHITECTURE:
 
-    Thread A: Ollama (suggestion mode) → overlay tokens
-    Thread B: Ollama (conversational mode) → voice_output.speak_stream()
+Problem with pure parallel: two simultaneous Ollama calls compete for the
+same GPU. On 6GB VRAM with llama3.1:8b, both slow down — the suggestion
+stream wins because it started first, voice arrives after overlay anyway.
 
-Both start simultaneously after screen read.
-Watcher starts speaking within ~1s of first sentence completing.
-Overlay fills with suggestion text at the same time.
-No silence gap. No waiting for one before the other starts.
+Solution: STAGGER intentionally.
+    1. Start conversation stream FIRST — short prompt, fast to generate
+    2. 600ms later start suggestion stream
+    3. Voice speaks while suggestion is still generating
+    4. Overlay appears after voice has already started
 
-THREAD COORDINATION:
-    We use threading.Thread for both streams.
-    Both are daemon threads — they die if main exits.
-    The pipeline waits for BOTH to complete before releasing the
-    _is_processing lock. This prevents a new trigger firing while
-    either stream is still running.
+This matches how Jarvis actually worked — he spoke WHILE computing,
+not after. The voice leads, the result follows.
 
-    threading.Thread.join() blocks until that thread finishes.
-    We start both, then join both — parallel execution, sequential completion.
+CONVERSATION PROMPT IS SHORT ON PURPOSE:
+    We cap conversation at num_predict=80 — roughly 2-3 sentences.
+    Short generation = first sentence ready in ~1s = voice starts fast.
+    Suggestion gets the full token budget since it needs to be accurate.
 """
 
 import threading
+import time
 from core.logger import get_logger
 from brain.llm import llm_client, get_acknowledgement
 from input.screen_reader import screen_reader
 
 log = get_logger(__name__)
+
+# How long to wait before starting suggestion stream after conversation starts.
+# Gives conversation stream a head start so voice fires before overlay appears.
+SUGGESTION_STREAM_DELAY = 0.6  # seconds
 
 
 class Orchestrator:
@@ -71,16 +76,15 @@ class Orchestrator:
         log.info("Screen read — app: %s, chars: %d", app_name, len(text_content))
 
         # ---------------------------------------------------------------
-        # Step 2: Instant acknowledgement — zero latency, fires immediately
+        # Step 2: Instant acknowledgement
         # ---------------------------------------------------------------
         if self._voice_output:
-            self._voice_output.clear_queue()  # Clear any leftover audio
+            self._voice_output.clear_queue()
             ack = get_acknowledgement(app_name)
             self._voice_output.speak(ack, blocking=False)
-            log.info("Acknowledgement queued: %s", ack)
 
         # ---------------------------------------------------------------
-        # Step 3: Build both prompts
+        # Step 3: Build prompts
         # ---------------------------------------------------------------
         suggestion_prompt = self._build_suggestion_prompt(
             app_name, window_title, text_content, focused_text
@@ -90,56 +94,26 @@ class Orchestrator:
         )
 
         # ---------------------------------------------------------------
-        # Step 4: Launch both streams in parallel
+        # Step 4: Staggered streams
         #
-        # Thread A streams suggestion tokens → overlay
-        # Thread B streams conversational tokens → sentence buffer → speech
+        # conversation_thread starts immediately — short prompt, fast.
+        # suggestion_thread starts after SUGGESTION_STREAM_DELAY seconds.
         #
-        # WHY PARALLEL?
-        #   Sequential would mean: wait for suggestion to finish (3-4s),
-        #   THEN start generating the spoken line (another 2-3s).
-        #   Parallel means both generate simultaneously — Watcher speaks
-        #   while the overlay fills. No silence gap.
-        #
-        # GPU CONTENTION NOTE:
-        #   Two Ollama calls at once compete for GPU memory.
-        #   On 6GB VRAM with llama3.1:8b (~5GB), there may be slight
-        #   slowdown on both streams. If this causes problems we can
-        #   stagger: start conversation stream 0.5s after suggestion.
-        #   We test first before adding that complexity.
+        # Timeline:
+        #   t=0.0s  — ack spoken ("Reading your screen.")
+        #   t=0.0s  — conversation stream starts generating
+        #   t=0.6s  — suggestion stream starts generating
+        #   t=1.0s  — first conversational sentence speaks (voice leads)
+        #   t=2.5s  — overlay starts filling with suggestion
+        #   t=2.0s  — second conversational sentence speaks
+        #   t=3.5s  — overlay complete, [Tab]/[Esc] shown
         # ---------------------------------------------------------------
-        suggestion_result = {"text": ""}   # Mutable dict for thread result
-        stream_error = {"occurred": False}
-
-        def run_suggestion_stream():
-            """Thread A: suggestion tokens → overlay"""
-            try:
-                for token in llm_client.generate_stream(
-                    suggestion_prompt, mode="suggestion"
-                ):
-                    suggestion_result["text"] += token
-                    if self._inline_suggestion:
-                        self._inline_suggestion.show_streaming(token)
-
-                # Finalize overlay with Tab/Esc instructions
-                if self._inline_suggestion and suggestion_result["text"]:
-                    if not suggestion_result["text"].startswith("[Watcher:"):
-                        self._inline_suggestion.finalize_stream()
-                        log.info("Suggestion complete (%d chars): %s",
-                                 len(suggestion_result["text"]),
-                                 suggestion_result["text"][:60])
-                    else:
-                        log.warning("Bad suggestion from Ollama")
-                        stream_error["occurred"] = True
-            except Exception as e:
-                log.error("Suggestion stream error: %s", str(e))
-                stream_error["occurred"] = True
+        suggestion_result = {"text": ""}
 
         def run_conversation_stream():
-            """Thread B: conversational tokens → sentence buffer → speech"""
+            """Starts immediately. Short prompt → fast first sentence."""
             try:
                 if self._voice_output:
-                    # speak_stream() handles sentence detection and queuing
                     self._voice_output.speak_stream(
                         llm_client.generate_stream(
                             conversation_prompt, mode="spoken"
@@ -149,26 +123,50 @@ class Orchestrator:
             except Exception as e:
                 log.error("Conversation stream error: %s", str(e))
 
-        # Create both threads
-        suggestion_thread = threading.Thread(
-            target=run_suggestion_stream,
-            name="watcher-suggestion",
-            daemon=True
-        )
+        def run_suggestion_stream():
+            """Starts after delay. Suggestion appears while voice is speaking."""
+            try:
+                # Delay so conversation gets a head start
+                time.sleep(SUGGESTION_STREAM_DELAY)
+
+                for token in llm_client.generate_stream(
+                    suggestion_prompt, mode="suggestion"
+                ):
+                    suggestion_result["text"] += token
+                    if self._inline_suggestion:
+                        self._inline_suggestion.show_streaming(token)
+
+                if suggestion_result["text"] and \
+                   not suggestion_result["text"].startswith("[Watcher:"):
+                    if self._inline_suggestion:
+                        self._inline_suggestion.finalize_stream()
+                    log.info("Suggestion complete: %s",
+                             suggestion_result["text"][:60])
+                else:
+                    log.warning("Bad suggestion response")
+            except Exception as e:
+                log.error("Suggestion stream error: %s", str(e))
+
+        # Start conversation immediately
         conversation_thread = threading.Thread(
             target=run_conversation_stream,
             name="watcher-conversation",
             daemon=True
         )
 
-        # Start both simultaneously
-        suggestion_thread.start()
-        conversation_thread.start()
+        # Start suggestion with built-in delay
+        suggestion_thread = threading.Thread(
+            target=run_suggestion_stream,
+            name="watcher-suggestion",
+            daemon=True
+        )
 
-        # Wait for both to complete before releasing pipeline lock
-        # join() blocks until the thread's target function returns
-        suggestion_thread.join()
+        conversation_thread.start()
+        suggestion_thread.start()
+
+        # Wait for both before releasing lock
         conversation_thread.join()
+        suggestion_thread.join()
 
         log.info("Pipeline complete")
 
@@ -183,10 +181,6 @@ class Orchestrator:
         text_content: str,
         focused_text: str
     ) -> str:
-        """
-        Strict prompt for clean typed suggestion — zero personality.
-        Output must be exactly what gets typed into the app.
-        """
         parts = [f"APP: {app_name}"]
         if window_title and window_title != app_name:
             parts.append(f"WINDOW: {window_title}")
@@ -209,29 +203,32 @@ class Orchestrator:
         text_content: str,
     ) -> str:
         """
-        Prompt for Watcher's spoken conversational response.
+        Short, specific prompt for Watcher's spoken response.
 
-        This is what makes Watcher feel like Jarvis — he doesn't just announce
-        a result, he makes a remark, gives context, maybe a dry observation.
-        Streams sentence by sentence so speech starts before generation ends.
+        DELIBERATELY SHORT:
+            num_predict=80 in llm.py for spoken mode — ~2-3 sentences.
+            Short generation = first sentence ready faster = voice starts sooner.
+            We extract a short excerpt (300 chars) to keep the prompt lean.
+            Lean prompt + low token budget = fast first sentence.
 
-        The prompt is designed to produce 2-4 short sentences naturally —
-        enough for a real conversational feel without being verbose.
+        SPECIFIC INSTRUCTION:
+            "Pick one specific detail" forces Watcher to reference actual
+            content rather than giving a generic "I've read your screen" line.
+            Generic lines sound like a loading spinner. Specific ones sound
+            like Jarvis actually read it.
         """
         excerpt = ""
         if text_content and not text_content.startswith("[Screen"):
-            excerpt = text_content[-400:] if len(text_content) > 400 else text_content
+            excerpt = text_content[-300:] if len(text_content) > 300 else text_content
 
         return (
             f"APP: {app_name}\n"
-            f"WINDOW: {window_title}\n"
-            f"SCREEN EXCERPT:\n{excerpt}\n\n"
-            f"You are Watcher. You've just read the user's screen and prepared a suggestion.\n"
-            f"Have a brief conversation about what you see — 2 to 3 short sentences.\n"
-            f"Observe something specific from the screen content. Make a remark.\n"
-            f"Tell the user their suggestion is ready.\n"
-            f"Be Watcher — confident, dry, British, Jarvis-like.\n"
-            f"Do NOT say what the suggestion is. Do NOT repeat the screen content verbatim."
+            f"SCREEN:\n{excerpt}\n\n"
+            f"You are Watcher. You've read the user's screen.\n"
+            f"Speak 2 short sentences in Watcher's voice.\n"
+            f"Sentence 1: Pick ONE specific detail from the screen and make a brief remark about it.\n"
+            f"Sentence 2: Tell the user their suggestion is ready.\n"
+            f"Be specific. Be brief. Sound like Jarvis."
         )
 
 
