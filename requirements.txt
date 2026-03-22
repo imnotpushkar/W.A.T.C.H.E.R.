@@ -1,45 +1,42 @@
 # ============================================================
 # WATCHER — Python Dependencies
 # ============================================================
-# Install all: pip install -r requirements.txt
+# Install: pip install -r requirements.txt
 #
-# COST NOTE: Every package here is free and open source.
-# edge-tts makes network calls to Microsoft's TTS service
-# (free, no account needed, no rate limits documented).
-# All other packages are fully local/offline.
+# PYTHON VERSION: 3.12+ required. Tested on 3.14.
+# COST: All free. edge-tts uses Microsoft's free TTS service (needs internet).
 # ============================================================
 
-# --- Core / Config ---
-python-dotenv==1.0.1        # Reads .env file into os.environ
+# --- Core ---
+python-dotenv>=1.0.1        # Reads .env into os.environ
 
-# --- LLM (Local AI Brain) ---
-requests==2.31.0            # HTTP client for talking to Ollama's REST API
-httpx==0.27.0               # Async HTTP client (used for streaming responses)
+# --- LLM ---
+requests>=2.31.0            # HTTP client for Ollama REST API
+httpx>=0.27.0               # Async HTTP for streaming
 
-# --- Screen Reading ---
-# uiautomation is Windows-only. Install separately:
-# pip install uiautomation
-# Listed here for documentation; may need manual install on some setups.
-uiautomation==2.0.18        # Windows Accessibility API wrapper
+# --- Screen Reading (Windows only) ---
+uiautomation>=2.0.18        # Windows Accessibility API
+comtypes>=1.2.1             # Required by uiautomation
 
 # --- Keyboard / Mouse ---
-pynput==1.7.6               # Global keyboard hook and hotkey detection
-pyautogui==0.9.54           # Types text and controls mouse on your behalf
+pynput>=1.7.6               # Global hotkey detection
+pyautogui>=0.9.54           # Types text on user's behalf
+pyperclip>=1.8.0            # Clipboard access (used by typist fallback)
 
 # --- Voice Output ---
-edge-tts==6.1.9             # Microsoft neural TTS (free, high quality)
-pygame==2.5.2               # Audio playback for TTS output files
-# pyttsx3==2.90             # Offline TTS fallback (uncomment if needed)
+edge-tts>=6.1.9             # Microsoft neural TTS (free, needs internet)
+playsound3>=1.0.0           # Audio playback — no C compilation needed
 
-# --- Voice Input (Phase 2 — install when needed) ---
-# faster-whisper==1.0.1     # Local speech-to-text
-# vosk==0.3.45              # Wake word / offline STT alternative
+# --- UI ---
+PySide6>=6.6.0              # Qt6 Python bindings — replaces PyQt5
+                            # PyQt5 does not support Python 3.12+
 
-# --- UI (Overlay, Tray, Settings) ---
-PyQt5==5.15.10              # Always-on-top transparent overlay window
+# --- Voice Input (Phase 2) ---
+# faster-whisper>=1.0.1     # Local speech-to-text
+# vosk>=0.3.45              # Wake word detection
 
-# --- Memory / Storage (Phase 2 — install when needed) ---
-# chromadb==0.5.0           # Local vector store for semantic memory search
+# --- Memory (Phase 2) ---
+# chromadb>=0.5.0           # Vector store for semantic memory
 
 # --- Utilities ---
-Pillow==10.3.0              # Image handling (used by pyautogui for screenshots)
+Pillow>=10.0.0              # Image handling for pyautogui
